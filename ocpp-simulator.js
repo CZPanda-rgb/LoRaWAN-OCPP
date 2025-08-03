@@ -6,10 +6,9 @@ const app = express();
 const cors = require('cors');
 const port = 3200;
 
-const chargePointId = 'pureWSEVSE';
-const ocppUrl = `ws://ocpp.eronx.cz:8080/steve/websocket/CentralSystemService/${chargePointId}`; // Změň podle potřeby
-//const chargePointId = 'fd4821';
-//const ocppUrl = `ws://ocpp.chargehq.net/ocpp16/${chargePointId}`; // Změň podle potřeby
+const chargePointId = 'fill_me_in';
+const ocppUrl = `ws://your_ocpp_domain:your_port/according_to_your_server/${chargePointId}`; // Změň podle potřeby
+
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -23,7 +22,8 @@ let transactionId = null;
 let energy = 0;
 let meterInterval = 30;
 let hearthbeatInterval = 10; // default fallback (sekundy)
-let maxCurrent = 10;
+let maxCurrent = 10; //default 10 Amperes
+let meterActive;
 
 const send = (action, payload) => {
   const msgId = uuidv4();
@@ -34,7 +34,7 @@ const send = (action, payload) => {
 function startHeartbeatLoop() {
   setInterval(() => {
     send('Heartbeat', {});
-    console.log(`[OCPP] Posílám Hearthbeat, interval interval: ${hearthbeatInterval}s`);
+    console.log(`[OCPP] Posílám Hearthbeat, interval: ${hearthbeatInterval}s`);
   }, hearthbeatInterval * 1000);
 }
 function getUtcMidnightToday() {
@@ -53,11 +53,11 @@ const changeStatus = (newStatus) => {
 };
 
 const startMetering = () => {
-  if (meterInterval) clearInterval(meterInterval);
+  if (meterActive) clearInterval(meterActive);
   if (meterInterval < 1) {
     meterInterval = 1; // interval less than 1 second is too small
   }
-  meterInterval = setInterval(() => {
+  meterActive = setInterval(() => {
     energy += 100; // každých X sekund přidej 0.1 kWh (simulace)
     send('MeterValues', {
       connectorId: 1,
@@ -65,18 +65,19 @@ const startMetering = () => {
       meterValue: [{
         timestamp: new Date().toISOString(),
         sampledValue: [{
-          value: energy.toFixed(3),
+          value: energy.toFixed(0),
           unit: 'Wh',
           measurand: 'Energy.Active.Import.Register',
         }]
       }]
     });
+    console.log(`Odeslali jsme hodnotu z meteru: ${energy} Wh, MeterValueSample interval je: ${meterInterval} s`);
   }, meterInterval * 1000);
 };
 
 const stopMetering = () => {
-  clearInterval(meterInterval);
-  meterInterval = null;
+  clearInterval(meterActive);
+  meterActive = null;
 };
 
 ws.on('open', () => {
@@ -84,8 +85,8 @@ ws.on('open', () => {
 
 // Po připojení a úspěšném BootNotification
 send('BootNotification', {
-  chargePointModel: 'ACME Model X',
-  chargePointVendor: 'ACME Inc.'
+  chargePointModel: 'Krystof Charge 1',
+  chargePointVendor: 'Krystof EVSEs'
 }, () => {
   // server odpověděl
   heartbeatInterval = responsePayload.interval || 60;
@@ -131,6 +132,10 @@ ws.on('message', (data) => {
       const value = parseInt(payload.value, 10);
       if (!isNaN(value) && value > 0) {
       meterInterval = value;
+      if(connectorStatus === 'Charging'){
+        stopMetering();
+        startMetering(); //new interval gets applied
+      }
       console.log(`zmenen interval MeterValueSampleInterval na ${meterInterval}s`);
       ws.send(JSON.stringify([3, callId, {
         status: 'Accepted' }
@@ -203,6 +208,19 @@ ws.on('message', (data) => {
         console.log(`Nepodařilo se vyčíst max proud z požadavku SetChargingProfile`);
       }
     }
+    else if(action === 'RemoteStartTransaction'){
+      const responseMessage = [3, callId, {status: "Accepted"}];
+      ws.send(JSON.stringify(responseMessage, null, 2));
+      console.log(`Odpověď na RemoteStartTransaction:`, JSON.stringify(responseMessage, null, 2));
+      send('StartTransaction', {
+      connectorId: 1,
+      idTag: '12345',
+      meterStart: 0,
+      timestamp: new Date().toISOString()
+    });
+      changeStatus('Charging');
+      startMetering();
+    }
   }
 });
 
@@ -216,17 +234,12 @@ rl.on('line', () => {
     send('StartTransaction', {
       connectorId: 1,
       idTag: '12345',
-      meterStart: 0,
+      meterStart: energy,
       timestamp: new Date().toISOString()
     });
-
-  ws.on('StartTransaction', (payload) => {
-  transactionId = payload.transactionId;
-  console.log('📥 transactionId přijat od serveru:', transactionId);
-  });
-
     startMetering();
-  } else if (connectorStatus === 'Charging') {
+    } 
+    else if (connectorStatus === 'Charging') {
     console.log('[SIM] Ukončení nabíjení..., transakce ID: ', transactionId);
     send('StopTransaction', {
       transactionId: transactionId,
@@ -236,7 +249,6 @@ rl.on('line', () => {
       reason: "EVDisconnected"
     });
     stopMetering();
-    energy = 0;
     changeStatus('Available');
   }
 });

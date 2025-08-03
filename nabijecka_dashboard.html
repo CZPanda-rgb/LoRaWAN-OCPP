@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <title>Stav Nabíječky</title>
+</head>
+<body>
+  <h1>EVSE Dashboard</h1>
+  <div id="stav"></div>
+  <div id="energy"></div>
+
+  <script>
+    async function updateStatus() {
+      const res = await fetch('http://localhost:3200/status');
+      const data = await res.json();
+      var parsed = JSON.parse(data);
+      const energy = await fetch('http://localhost:3200/energy');
+      const dataEnergy = await energy.json();
+      var parsedEnergy = JSON.parse(dataEnergy);
+
+      document.getElementById('stav').innerText = "ConnectorStatus:" + parsed.ConnectorStatus;
+      if (parsed.ConnectorStatus === "Charging"){
+        document.getElementById('energy').innerText = "Energy in transaction: " + parsedEnergy.energy;
+    }
+    else {
+      document.getElementById('energy').innerText = "No transaction running";
+    }
+    }
+    setInterval(updateStatus, 1000);
+    updateStatus();
+  </script>
+</body>
+</html>
