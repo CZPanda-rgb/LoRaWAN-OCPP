@@ -6,9 +6,12 @@ const app = express();
 const cors = require('cors');
 const port = 3200;
 
-const chargePointId = 'fill_me_in';
-const ocppUrl = `ws://your_ocpp_domain:your_port/according_to_your_server/${chargePointId}`; // Změň podle potřeby
 
+
+const chargePointId = 'pureWSEVSE';
+const ocppUrl =  // Change according to your server
+const MeteoScientificAPIkey = 'fillmein';
+const DevEUI = 'fillmein';
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -34,7 +37,7 @@ const send = (action, payload) => {
 function startHeartbeatLoop() {
   setInterval(() => {
     send('Heartbeat', {});
-    console.log(`[OCPP] Posílám Hearthbeat, interval: ${hearthbeatInterval}s`);
+    console.log(`[OCPP] Sending heartbeat, interval: ${hearthbeatInterval}s`);
   }, hearthbeatInterval * 1000);
 }
 function getUtcMidnightToday() {
@@ -58,7 +61,7 @@ const startMetering = () => {
     meterInterval = 1; // interval less than 1 second is too small
   }
   meterActive = setInterval(() => {
-    energy += 100; // každých X sekund přidej 0.1 kWh (simulace)
+    energy += 100; // each x seconds add 0.1 kWh (simulation)
     send('MeterValues', {
       connectorId: 1,
       transactionId: transactionId,
@@ -71,7 +74,7 @@ const startMetering = () => {
         }]
       }]
     });
-    console.log(`Odeslali jsme hodnotu z meteru: ${energy} Wh, MeterValueSample interval je: ${meterInterval} s`);
+    console.log(`Meter value has been sent: ${energy} Wh, MeterValueSample interval is: ${meterInterval} s`);
   }, meterInterval * 1000);
 };
 
@@ -80,8 +83,42 @@ const stopMetering = () => {
   meterActive = null;
 };
 
+async function sendDownlink(payloadBase64, fPort = 1, confirmed = false, flush = false) {
+  const url = `https://console.meteoscientific.com/api/devices/${DevEUI}/queue`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      "Accept": "application/json",
+      "Authorization": `Bearer ${MeteoScientificAPIkey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      queueItem: {
+        data: payloadBase64,
+        fPort,
+        confirmed,
+        flushQueue: flush
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Error occured while sending downlink: ${response.status} ${errorBody}`);
+  }
+
+  console.log("Downlink sent succesfully: ", await response.json());
+}
+function hexToBase64(hex) {
+  // převede hex string na buffer
+  const buffer = Buffer.from(hex, "hex");
+  // převede buffer na Base64 string
+  return buffer.toString("base64");
+}
+
 ws.on('open', () => {
-  console.log('[OCPP] Připojeno k backendu, posílám BootNotification...');
+  console.log('[OCPP] Connected to OCPP server, sending BootNotification...');
 
 // Po připojení a úspěšném BootNotification
 send('BootNotification', {
@@ -105,7 +142,7 @@ ws.on('message', (data) => {
     // Pokud odpověď na BootNotification obsahuje interval
     if (payload.interval) {
       hearthbeatInterval= payload.interval;
-      console.log(`[OCPP] Nastavený hearthbeat interval: ${hearthbeatInterval}s`);
+      console.log(`[OCPP] Hearthbeat interval is now set: ${hearthbeatInterval}s`);
       startHeartbeatLoop();
     }
     if (payload.transactionId){
@@ -114,20 +151,9 @@ ws.on('message', (data) => {
     }  
   } else if (msg[0] === 2) {
     const [_, callId, action, payload] = msg;
-    console.log(`[OCPP] Příchozí požadavek: ${action}, obsah: ${JSON.stringify(payload)}`);
+    console.log(`[OCPP] Incoming request ${action}, obsah: ${JSON.stringify(payload)}`);
 
-      if (action === 'StartTransaction') {
-        ws.send(JSON.stringify([3, callId, {
-          transactionId: transactionId,
-          idTagInfo: { status: 'Accepted' }
-        }]));
-      } else if (action === 'StopTransaction') {
-        transactionId = null;
-        ws.send(JSON.stringify([3, callId, {
-          idTagInfo: { status: 'Accepted' }
-        }]));
-    } 
-    else if (action === 'ChangeConfiguration') {
+    if (action === 'ChangeConfiguration') {
       if (payload.key === 'MeterValueSampleInterval') {
       const value = parseInt(payload.value, 10);
       if (!isNaN(value) && value > 0) {
@@ -136,6 +162,17 @@ ws.on('message', (data) => {
         stopMetering();
         startMetering(); //new interval gets applied
       }
+      try{
+          if (meterInterval <= 1275){
+            const hexToSend = "06";
+            let meterIntervalHexFormated = meterInterval.toString(16);
+            meterIntervalHexFormated = meterIntervalHexFormated.padStart(2, "0");
+            sendDownlink(hexToBase64(hexToSend + meterIntervalHexFormated)); //send request to MeteoScientific
+          }
+        }
+        catch{
+          console.log('MeterValueSampleInterval is higher than 1275 A or meteoscientific console is not available');
+        }
       console.log(`zmenen interval MeterValueSampleInterval na ${meterInterval}s`);
       ws.send(JSON.stringify([3, callId, {
         status: 'Accepted' }
@@ -164,15 +201,22 @@ ws.on('message', (data) => {
             readonly: false,
             value: meterInterval
           });
-        } else {
+        } else if (key === 'HearthbeatInterval') {
+          response.configurationKey.push({
+            key: 'HeartbeatInterval',
+            readonly: false,
+            value: heartbeatInterval
+          });
+        }
+        else {
           response.unknownKey.push(key);
         }
       }
       const responseMessage = [3, callId, response];
       ws.send(JSON.stringify(responseMessage, null, 2));
-      console.log(`Odpověď na GetConfiguration:`, JSON.stringify(responseMessage, null, 2));
+      console.log(`Response to GetConfiguration:`, JSON.stringify(responseMessage, null, 2));
       }
-      else if (action === 'GetCompositeSchedule') {
+      else if (action === 'GetCompositeSchedule') {//so far we do not send request to the EVSE and simply believe, that EVSE and server side have the same current value
         const requestedKeys = payload.key || [];
         let isoStart = getUtcMidnightToday();
         const response = {
@@ -192,60 +236,98 @@ ws.on('message', (data) => {
       }
       const responseMessage = [3, callId, response];
       ws.send(JSON.stringify(responseMessage, null, 2));
-      console.log(`Odpověď na GetConfiguration:`, JSON.stringify(responseMessage, null, 2));
+      console.log(`Response to GetConfiguration:`, JSON.stringify(responseMessage, null, 2));
     }
     else if (action === 'SetChargingProfile'){
       try{
         if (payload.csChargingProfiles.chargingSchedule.chargingRateUnit === 'A' ){
           maxCurrent = payload.csChargingProfiles.chargingSchedule.chargingSchedulePeriod[0].limit;
-
+          try{
+          if (maxCurrent <= 255){
+            const hexToSend = "09";
+            let maxCurrentHexFormated = maxCurrent.toString(16);
+            maxCurrentHexFormated = maxCurrentHexFormated.padStart(2, "0");
+            sendDownlink(hexToBase64(hexToSend + maxCurrentHexFormated)); //send request to MeteoScientific
+          }
+        }
+        catch{
+          console.log('Max current is higher than 255 A or meteoscientific console is not available');
+        }
         }
         const responseMessage = [3, callId, {status: "Accepted"}];
         ws.send(JSON.stringify(responseMessage, null, 2));
-        console.log(`Odpověď na GetConfiguration:`, JSON.stringify(responseMessage, null, 2));
+        console.log(`Response to GetConfiguration:`, JSON.stringify(responseMessage, null, 2));
       }
       catch{
-        console.log(`Nepodařilo se vyčíst max proud z požadavku SetChargingProfile`);
+        console.log(`Max current could not be read from request SetChargingProfile`);
       }
     }
     else if(action === 'RemoteStartTransaction'){
+      try{
+        idTag = payload.idTag;
+      }
+      catch{
+        console.log("chybí idTag u RemoteStartTransaction");
+      }
       const responseMessage = [3, callId, {status: "Accepted"}];
       ws.send(JSON.stringify(responseMessage, null, 2));
-      console.log(`Odpověď na RemoteStartTransaction:`, JSON.stringify(responseMessage, null, 2));
+      console.log(`Response to RemoteStartTransaction:`, JSON.stringify(responseMessage, null, 2));
       send('StartTransaction', {
       connectorId: 1,
-      idTag: '12345',
-      meterStart: 0,
+      idTag: idTag,
+      meterStart: energy,
       timestamp: new Date().toISOString()
     });
       changeStatus('Charging');
       startMetering();
+      sendDownlink(hexToBase64("05"));
+    }
+    else if(action === 'RemoteStopTransaction'){
+      if(payload.transactionId === transactionId){
+        const responseMessage = [3, callId, {status: "Accepted"}];
+        ws.send(JSON.stringify(responseMessage, null, 2));
+        console.log(`Response to RemoteStopTransaction:`, JSON.stringify(responseMessage, null, 2));
+        changeStatus('Available');
+        stopMetering();
+        sendDownlink(hexToBase64("06"));
+        send(
+          'StopTransaction', {
+            transactionId: transactionId,
+            idTag: idTag,
+            meterStop: energy,
+            timestamp: new Date().toISOString(),
+            reason: "Remote"
+          }
+        );
+      }
     }
   }
 });
 
 rl.on('line', () => {
   if (connectorStatus === 'Available') {
-    console.log('[SIM] Přechod na Preparing...');
+    console.log('[SIM] Transition to Preparing...');
     changeStatus('Preparing');
   } else if (connectorStatus === 'Preparing') {
-    console.log('[SIM] Přechod na Charging...');
+    console.log('[SIM] Transition to Charging...');
     changeStatus('Charging');
+    idTag = '12345';
     send('StartTransaction', {
       connectorId: 1,
-      idTag: '12345',
+      idTag: idTag,
       meterStart: energy,
       timestamp: new Date().toISOString()
     });
     startMetering();
     } 
     else if (connectorStatus === 'Charging') {
-    console.log('[SIM] Ukončení nabíjení..., transakce ID: ', transactionId);
+    console.log('[SIM] Charging cancelled..., transakce ID: ', transactionId);
+    idTag = '12345';
     send('StopTransaction', {
       transactionId: transactionId,
       meterStop: Math.floor(energy * 1000),
       timestamp: new Date().toISOString(),
-      idTag: '12345',
+      idTag: idTag,
       reason: "EVDisconnected"
     });
     stopMetering();
@@ -260,6 +342,8 @@ const corsOptions = {
 }
 
 app.use(cors());
+app.use(express.json());
+
 
 app.use(function (req, res, next) {
     res.header('Access-Control-Allow-Origin', "*");
@@ -276,7 +360,22 @@ app.get('/energy', (req, res) => {
   res.json('{"energy": "' + energy + '"}');
 });
 
-// Spuštění web serveru
+// Endpoint where LoRaWAN console will send requests
+app.post("/lorawan", (req, res) => {
+  const body = req.body;
+  const payloadLorawan = body?.data;
+  console.log("Přišel request z LoRaWAN:");
+  console.log("Headers:", req.headers);
+  console.log("Body:", req.body);
+
+  // můžeš uložit do DB, poslat dál, zpracovat payload atd.
+  
+  // always send 2xx response, otherwise TTN marks request as failed
+  res.status(200).send("OK");
+});
+
+
+// Launch web server
 app.listen(port, () => {
-  console.log(`Web rozhraní běží na http://localhost:${port}`);
+  console.log(`Web interface is running on http://localhost:${port}`);
 });
