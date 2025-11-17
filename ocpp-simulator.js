@@ -8,10 +8,10 @@ const port = 3200;
 
 
 
-const chargePointId = 'pureWSEVSE';
-const ocppUrl =  // Change according to your server
-const MeteoScientificAPIkey = 'fillmein';
-const DevEUI = 'fillmein';
+const chargePointId = 'fillmein';
+const ocppUrl = ``; // Change according to your server
+const MeteoScientificAPIkey = 'yourAPIkey';
+const DevEUI = 'yourDevEUI';
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -24,9 +24,14 @@ let connectorStatus = 'Available';
 let transactionId = null;
 let energy = 0;
 let meterInterval = 30;
-let hearthbeatInterval = 10; // default fallback (sekundy)
+let heartbeatInterval = 10; // default fallback (sekundy)
 let maxCurrent = 10; //default 10 Amperes
 let meterActive;
+let TxQueue = "", pointerTxQueue, initiateSend = 0;
+const OcppMessagesTypes = ["BootNotification", "Heartbeat", "StartTransaction", "StopTransaction", "RemoteStartTransaction", "RemoteStopTransaction", "MeterValueSampleInterval", "HeartbeatInterval", "MeterValueSampleInterval", "CurrentLimit", "PowerLimit", "CurrentLimit", "PowerLimit", "Energy.Active.Import.Register", "ConnectorStatus"];
+// memory for storing incoming callIds
+const pendingCalls = [];
+let OcppMessageTypeVariable = 0; //bitmask of OCPP message types according to table eg. index 0 = BootupNotification, index 1 = Heartbeat ...
 
 const send = (action, payload) => {
   const msgId = uuidv4();
@@ -34,15 +39,13 @@ const send = (action, payload) => {
   ws.send(JSON.stringify(frame));
   return msgId;
 };
-function startHeartbeatLoop() {
-  setInterval(() => {
-    send('Heartbeat', {});
-    console.log(`[OCPP] Sending heartbeat, interval: ${hearthbeatInterval}s`);
-  }, hearthbeatInterval * 1000);
-}
 function getUtcMidnightToday() {
   const now = new Date();
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+function sendConfigurationWSresponse(respWS){
+  ws.send(JSON.stringify(respWS, null, 2));
+  console.log(`Response to GetConfiguration:`, JSON.stringify(respWS, null, 2));
 }
 
 const changeStatus = (newStatus) => {
@@ -83,33 +86,38 @@ const stopMetering = () => {
   meterActive = null;
 };
 
-async function sendDownlink(payloadBase64, fPort = 1, confirmed = false, flush = false) {
+async function sendDownlink(fPort = 1, confirmed = false, flush = false) {
   const url = `https://console.meteoscientific.com/api/devices/${DevEUI}/queue`;
+  console.log(`Contents of TxQueue (LoRaWAN Payload): ${TxQueue}`);
+  setTimeout(async () => {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        "Accept": "application/json",
+        "Authorization": `Bearer ${MeteoScientificAPIkey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        queueItem: {
+          data: TxQueue,
+          fPort,
+          confirmed,
+          flushQueue: flush
+        }
+      })
+    });
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      "Accept": "application/json",
-      "Authorization": `Bearer ${MeteoScientificAPIkey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      queueItem: {
-        data: payloadBase64,
-        fPort,
-        confirmed,
-        flushQueue: flush
-      }
-    })
-  });
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`Error occured while sending downlink: ${response.status} ${errorBody}`);
+    }
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Error occured while sending downlink: ${response.status} ${errorBody}`);
-  }
-
-  console.log("Downlink sent succesfully: ", await response.json());
+    console.log("Downlink sent succesfully: ", await response.json());
+    TxQueue = "";
+    initiateSend = 0;
+  }, 5000);
 }
+
 function hexToBase64(hex) {
   // převede hex string na buffer
   const buffer = Buffer.from(hex, "hex");
@@ -117,22 +125,26 @@ function hexToBase64(hex) {
   return buffer.toString("base64");
 }
 
-ws.on('open', () => {
-  console.log('[OCPP] Connected to OCPP server, sending BootNotification...');
+function connectOCPP() {
+  ws.on('open', () => {
+    console.log('[OCPP] Connected to OCPP server, sending BootNotification...');
 
-// Po připojení a úspěšném BootNotification
-send('BootNotification', {
-  chargePointModel: 'Krystof Charge 1',
-  chargePointVendor: 'Krystof EVSEs'
-}, () => {
-  // server odpověděl
-  heartbeatInterval = responsePayload.interval || 60;
+  // Po připojení a úspěšném BootNotification
+    send('BootNotification', {
+      chargePointModel: 'Krystof Charge 1',
+      chargePointVendor: 'Krystof EVSEs'
+    }, () => {
+      // server odpověděl
+      heartbeatInterval = responsePayload.interval || 60;
 
-});
-
-
-});
-
+    });
+  });
+}
+connectOCPP();
+ws.on('error', (err) => {
+    console.log('Connection error, try again in 5 seconds', err.message);
+    setTimeout(connectOCPP, 5000);
+  });
 ws.on('message', (data) => {
   const msg = JSON.parse(data);
   if (msg[0] === 3) {
@@ -141,9 +153,8 @@ ws.on('message', (data) => {
 
     // Pokud odpověď na BootNotification obsahuje interval
     if (payload.interval) {
-      hearthbeatInterval= payload.interval;
-      console.log(`[OCPP] Hearthbeat interval is now set: ${hearthbeatInterval}s`);
-      startHeartbeatLoop();
+      heartbeatInterval= payload.interval; //asi by chtelo predat dal na Lorawan zarizeni
+      console.log(`[OCPP] Hearthbeat interval is now set: ${heartbeatInterval}s`);
     }
     if (payload.transactionId){
       transactionId = payload.transactionId;
@@ -167,13 +178,50 @@ ws.on('message', (data) => {
             const hexToSend = "06";
             let meterIntervalHexFormated = meterInterval.toString(16);
             meterIntervalHexFormated = meterIntervalHexFormated.padStart(2, "0");
-            sendDownlink(hexToBase64(hexToSend + meterIntervalHexFormated)); //send request to MeteoScientific
+            OcppMessageTypeVariable |= (1 << 6);
+            TxQueue += hexToBase64(hexToSend + meterIntervalHexFormated); //send request to MeteoScientific
+            if (initiateSend == 0){
+                sendDownlink();
+                initiateSend = 1;
+            }
           }
         }
         catch{
           console.log('MeterValueSampleInterval is higher than 1275 A or meteoscientific console is not available');
         }
       console.log(`zmenen interval MeterValueSampleInterval na ${meterInterval}s`);
+      ws.send(JSON.stringify([3, callId, {
+        status: 'Accepted' }
+      ]));
+      } else {
+      console.error('Neplatná hodnota MeterValueSampleInterval:', payload.value);
+      ws.send(JSON.stringify([3, callId, {
+        status: 'Rejected' }
+      ]));
+    }
+  }
+  else if (payload.key === 'HeartbeatInterval') {
+      const value = parseInt(payload.value, 10);
+      if (!isNaN(value) && value > 0) {
+      heartbeatInterval = value;
+      try{
+          if (meterInterval <= 1275){
+            const hexToSend = "07";
+            let heartbeatIntervalDivied = heartbeatInterval / 5;
+            let heartbeatIntervalHexFormated = heartbeatIntervalDivied .toString(16);
+            heartbeatIntervalHexFormated = heartbeatIntervalHexFormated.padStart(2, "0");
+            OcppMessageTypeVariable |= (1 << 7);
+            TxQueue += hexToBase64(hexToSend + heartbeatIntervalHexFormated); //send request to MeteoScientific
+            if (initiateSend == 0){
+                sendDownlink();
+                initiateSend = 1;
+            }
+          }
+        }
+        catch{
+          console.log('HeartbeatInterval is higher than 1275 seconds or meteoscientific console is not available');
+        }
+      console.log(`zmenen interval Heartbeat interval na ${heartbeatInterval}s`);
       ws.send(JSON.stringify([3, callId, {
         status: 'Accepted' }
       ]));
@@ -193,30 +241,41 @@ ws.on('message', (data) => {
         configurationKey: [],
         unknownKey: []
       };
-
+      let sendWSImmediately = 1;
       for (const key of requestedKeys) {
-        if (key === 'MeterValueSampleInterval') {
-          response.configurationKey.push({
-            key: 'MeterValueSampleInterval',
-            readonly: false,
-            value: meterInterval
-          });
-        } else if (key === 'HearthbeatInterval') {
+        if (key === 'HeartbeatInterval') {
           response.configurationKey.push({
             key: 'HeartbeatInterval',
             readonly: false,
             value: heartbeatInterval
           });
         }
+        else if (key === 'MeterValueSampleInterval') {
+          sendWSImmediately = 0;
+          const hexToSend = "08";
+          OcppMessageTypeVariable |= (1 << 8);
+          TxQueue += hexToBase64(hexToSend); //send request to MeteoScientific
+          if (initiateSend == 0){
+                sendDownlink();
+                initiateSend = 1;
+          }
+        } 
         else {
           response.unknownKey.push(key);
         }
       }
-      const responseMessage = [3, callId, response];
-      ws.send(JSON.stringify(responseMessage, null, 2));
-      console.log(`Response to GetConfiguration:`, JSON.stringify(responseMessage, null, 2));
+      pendingCalls.push({ OcppMessageTypeVariable, callId, timestamp: Date.now() });
+      console.log("Call ID has been saved together with variable storing info which OCPP recognised variables has been polled, the variable is: ");
+      console.log(OcppMessageTypeVariable.toString(2));
+      OcppMessageTypeVariable = 0;
+      if(sendWSImmediately === 1){  //exists because getHeartbeat is an exceptional case, where we dont ask LoRawan device for an answer but send an immediate answer
+        const responseMessage = [3, callId, response];
+        sendConfigurationWSresponse(responseMessage);
+        
       }
-      else if (action === 'GetCompositeSchedule') {//so far we do not send request to the EVSE and simply believe, that EVSE and server side have the same current value
+      
+      }
+      else if (action === 'GetCompositeSchedule') {//so far we do not send request to the EVSE and simply believe, that EVSE and server side have the same electric current value
         const requestedKeys = payload.key || [];
         let isoStart = getUtcMidnightToday();
         const response = {
@@ -247,7 +306,11 @@ ws.on('message', (data) => {
             const hexToSend = "09";
             let maxCurrentHexFormated = maxCurrent.toString(16);
             maxCurrentHexFormated = maxCurrentHexFormated.padStart(2, "0");
-            sendDownlink(hexToBase64(hexToSend + maxCurrentHexFormated)); //send request to MeteoScientific
+            TxQueue += hexToBase64(hexToSend + maxCurrentHexFormated); //add to TxQueue
+            if (initiateSend == 0){
+                sendDownlink();
+                initiateSend = 1;
+            }
           }
         }
         catch{
@@ -267,7 +330,7 @@ ws.on('message', (data) => {
         idTag = payload.idTag;
       }
       catch{
-        console.log("chybí idTag u RemoteStartTransaction");
+        console.log("idTag is missing along with RemoteStartTransaction message");
       }
       const responseMessage = [3, callId, {status: "Accepted"}];
       ws.send(JSON.stringify(responseMessage, null, 2));
@@ -280,7 +343,11 @@ ws.on('message', (data) => {
     });
       changeStatus('Charging');
       startMetering();
-      sendDownlink(hexToBase64("05"));
+      TxQueue += hexToBase64("05");
+      if (initiateSend == 0){
+        sendDownlink();
+        initiateSend = 1;
+      }
     }
     else if(action === 'RemoteStopTransaction'){
       if(payload.transactionId === transactionId){
@@ -289,9 +356,13 @@ ws.on('message', (data) => {
         console.log(`Response to RemoteStopTransaction:`, JSON.stringify(responseMessage, null, 2));
         changeStatus('Available');
         stopMetering();
-        sendDownlink(hexToBase64("06"));
+        TxQueue += hexToBase64("06");
+        if (initiateSend == 0){
+                sendDownlink();
+                initiateSend = 1;
+            }
         send(
-          'StopTransaction', {
+          'StopTransaction', { //TODO wait for Device reply over LORAWAN not to send immediately stoptransaction
             transactionId: transactionId,
             idTag: idTag,
             meterStop: energy,
@@ -364,12 +435,68 @@ app.get('/energy', (req, res) => {
 app.post("/lorawan", (req, res) => {
   const body = req.body;
   const payloadLorawan = body?.data;
-  console.log("Přišel request z LoRaWAN:");
+  console.log("Request from LoRaWAN console received:");
   console.log("Headers:", req.headers);
   console.log("Body:", req.body);
 
   // můžeš uložit do DB, poslat dál, zpracovat payload atd.
-  
+  //tento blok presunout do odpovedi od MeteoScientific casti kodu + ohlidat jestli pozadavek obsahuje zpravy co umime odpovedet hned ze strany serveru a kdyz ne tak pockat s odpovedi az budeme mit vsechny odpovedi z Lorawan zarizeni
+    const buf = Buffer.from(body.data, "base64");
+    const response = {
+        configurationKey: [],
+        unknownKey: []
+      };
+    let RxBufPointer = 0;
+    while (RxBufPointer < buf.length){
+      if(buf[RxBufPointer] === 1){
+        send('Heartbeat', {});
+        console.log(`[OCPP] Sending heartbeat, interval: ${heartbeatInterval}s`);
+        RxBufPointer++;
+      }
+      if (buf[RxBufPointer] === 8 && buf[RxBufPointer + 1]!== undefined){
+        const match = pendingCalls.find(entry => entry.OcppMessageTypeVariable === 0b100000000);
+        response.configurationKey.push({
+        key: 'MeterValueSampleInterval',
+        readonly: false,
+        value: buf[RxBufPointer + 1] * 5
+        });
+        const responseMessage = [3, match.callId, response];
+        sendConfigurationWSresponse(responseMessage);
+        RxBufPointer += 2;
+      }
+      if(buf[RxBufPointer] === 11){
+        let dump = buf[RxBufPointer];
+        dump = buf[RxBufPointer + 1];
+        console.log(`[OCPP] Received CurrentLimit`);
+        RxBufPointer +=2;
+      }
+      if(buf[RxBufPointer] === 12){
+        let dump = buf[RxBufPointer];
+        dump = buf[RxBufPointer + 1];
+        console.log(`[OCPP] Received PowerLimit`);
+        RxBufPointer +=2;
+      }
+      if(buf[RxBufPointer] === 13){
+        let dump = buf[RxBufPointer];
+        dump = buf[RxBufPointer + 1];
+        dump = buf[RxBufPointer + 2];
+        dump = buf[RxBufPointer + 3];
+        console.log(`[OCPP] Received Energy.Active.Import.Register`);
+        RxBufPointer +=4;
+      }
+      if(buf[RxBufPointer] === 12){
+        let dump = buf[RxBufPointer];
+        dump = buf[RxBufPointer + 1];
+        console.log(`[OCPP] Received PowerLimit`);
+        RxBufPointer +=2;
+      }
+      if(buf[RxBufPointer] === 14){
+        let dump = buf[RxBufPointer];
+        dump = buf[RxBufPointer + 1];
+        console.log(`[OCPP] Received PowerLimit`);
+        RxBufPointer +=2;
+      }
+    }
   // always send 2xx response, otherwise TTN marks request as failed
   res.status(200).send("OK");
 });
