@@ -8,9 +8,9 @@ const port = 3200;
 
 
 
-const chargePointId = 'fillmein';
-const ocppUrl = ``; // Change according to your server
-const MeteoScientificAPIkey = 'yourAPIkey';
+const chargePointId = 'yourEVSEid';
+const ocppUrl = `ws://example.com:port/something/${chargePointId}`; // Change according to your server
+const MeteoScientificAPIkey = 'yourMeteoScientificAPIKey';
 const DevEUI = 'yourDevEUI';
 
 const rl = readline.createInterface({
@@ -22,6 +22,7 @@ let ws = new WebSocket(ocppUrl, 'ocpp1.6');
 let messageId = 1;
 let connectorStatus = 'Available';
 let transactionId = null;
+let idTag = null;
 let energy = 0;
 let meterInterval = 30;
 let heartbeatInterval = 10; // default fallback (sekundy)
@@ -56,34 +57,6 @@ const changeStatus = (newStatus) => {
     errorCode: 'NoError',
     timestamp: new Date().toISOString()
   });
-};
-
-const startMetering = () => {
-  if (meterActive) clearInterval(meterActive);
-  if (meterInterval < 1) {
-    meterInterval = 1; // interval less than 1 second is too small
-  }
-  meterActive = setInterval(() => {
-    energy += 100; // each x seconds add 0.1 kWh (simulation)
-    send('MeterValues', {
-      connectorId: 1,
-      transactionId: transactionId,
-      meterValue: [{
-        timestamp: new Date().toISOString(),
-        sampledValue: [{
-          value: energy.toFixed(0),
-          unit: 'Wh',
-          measurand: 'Energy.Active.Import.Register',
-        }]
-      }]
-    });
-    console.log(`Meter value has been sent: ${energy} Wh, MeterValueSample interval is: ${meterInterval} s`);
-  }, meterInterval * 1000);
-};
-
-const stopMetering = () => {
-  clearInterval(meterActive);
-  meterActive = null;
 };
 
 async function sendDownlink(fPort = 1, confirmed = false, flush = false) {
@@ -131,8 +104,8 @@ function connectOCPP() {
 
   // Po připojení a úspěšném BootNotification
     send('BootNotification', {
-      chargePointModel: 'Krystof Charge 1',
-      chargePointVendor: 'Krystof EVSEs'
+      chargePointModel: 'SampleModel',
+      chargePointVendor: 'Sample EVSEs'
     }, () => {
       // server odpověděl
       heartbeatInterval = responsePayload.interval || 60;
@@ -169,10 +142,6 @@ ws.on('message', (data) => {
       const value = parseInt(payload.value, 10);
       if (!isNaN(value) && value > 0) {
       meterInterval = value;
-      if(connectorStatus === 'Charging'){
-        stopMetering();
-        startMetering(); //new interval gets applied
-      }
       try{
           if (meterInterval <= 1275){
             const hexToSend = "06";
@@ -233,7 +202,6 @@ ws.on('message', (data) => {
     }
   }
 }
-
     else if (action === 'GetConfiguration') {
       const requestedKeys = payload.key || [];
 
@@ -268,7 +236,7 @@ ws.on('message', (data) => {
       console.log("Call ID has been saved together with variable storing info which OCPP recognised variables has been polled, the variable is: ");
       console.log(OcppMessageTypeVariable.toString(2));
       OcppMessageTypeVariable = 0;
-      if(sendWSImmediately === 1){  //exists because getHeartbeat is an exceptional case, where we dont ask LoRawan device for an answer but send an immediate answer
+      if(sendWSImmediately === 1){  //exists because getHeartbeatInterlval is an exceptional case, where we dont ask LoRawan device for an answer but send an immediate answer
         const responseMessage = [3, callId, response];
         sendConfigurationWSresponse(responseMessage);
         
@@ -342,67 +310,25 @@ ws.on('message', (data) => {
       timestamp: new Date().toISOString()
     });
       changeStatus('Charging');
-      startMetering();
-      TxQueue += hexToBase64("05");
+      TxQueue += hexToBase64("04");
       if (initiateSend == 0){
         sendDownlink();
         initiateSend = 1;
       }
     }
     else if(action === 'RemoteStopTransaction'){
-      if(payload.transactionId === transactionId){
+      //if(payload.transactionId === transactionId){
         const responseMessage = [3, callId, {status: "Accepted"}];
         ws.send(JSON.stringify(responseMessage, null, 2));
         console.log(`Response to RemoteStopTransaction:`, JSON.stringify(responseMessage, null, 2));
         changeStatus('Available');
-        stopMetering();
-        TxQueue += hexToBase64("06");
+        TxQueue += hexToBase64("05");
         if (initiateSend == 0){
                 sendDownlink();
                 initiateSend = 1;
             }
-        send(
-          'StopTransaction', { //TODO wait for Device reply over LORAWAN not to send immediately stoptransaction
-            transactionId: transactionId,
-            idTag: idTag,
-            meterStop: energy,
-            timestamp: new Date().toISOString(),
-            reason: "Remote"
-          }
-        );
-      }
+      //}
     }
-  }
-});
-
-rl.on('line', () => {
-  if (connectorStatus === 'Available') {
-    console.log('[SIM] Transition to Preparing...');
-    changeStatus('Preparing');
-  } else if (connectorStatus === 'Preparing') {
-    console.log('[SIM] Transition to Charging...');
-    changeStatus('Charging');
-    idTag = '12345';
-    send('StartTransaction', {
-      connectorId: 1,
-      idTag: idTag,
-      meterStart: energy,
-      timestamp: new Date().toISOString()
-    });
-    startMetering();
-    } 
-    else if (connectorStatus === 'Charging') {
-    console.log('[SIM] Charging cancelled..., transakce ID: ', transactionId);
-    idTag = '12345';
-    send('StopTransaction', {
-      transactionId: transactionId,
-      meterStop: Math.floor(energy * 1000),
-      timestamp: new Date().toISOString(),
-      idTag: idTag,
-      reason: "EVDisconnected"
-    });
-    stopMetering();
-    changeStatus('Available');
   }
 });
 
@@ -439,7 +365,6 @@ app.post("/lorawan", (req, res) => {
   console.log("Headers:", req.headers);
   console.log("Body:", req.body);
 
-  // můžeš uložit do DB, poslat dál, zpracovat payload atd.
   //tento blok presunout do odpovedi od MeteoScientific casti kodu + ohlidat jestli pozadavek obsahuje zpravy co umime odpovedet hned ze strany serveru a kdyz ne tak pockat s odpovedi az budeme mit vsechny odpovedi z Lorawan zarizeni
     const buf = Buffer.from(body.data, "base64");
     const response = {
@@ -453,7 +378,48 @@ app.post("/lorawan", (req, res) => {
         console.log(`[OCPP] Sending heartbeat, interval: ${heartbeatInterval}s`);
         RxBufPointer++;
       }
-      if (buf[RxBufPointer] === 8 && buf[RxBufPointer + 1]!== undefined){
+      else if (buf[RxBufPointer] === 3) { //StopTransaction LoRaWAN -> OCPP Server
+        // First check, if we have 5 bytes: opcode + 4 data bytes
+        if (RxBufPointer + 4 >= buf.length) {
+          console.log(`[OCPP] ERROR: StopTransaction – not enough data. Expecting 5 bytes, only ${buf.length - RxBufPointer} received.`);
+          break; // nebo RxBufPointer++; podle toho, jestli chceš pokračovat, ale nehavarovat
+        }
+
+        try {
+          // safely load 4 bytes
+          const b1 = buf[RxBufPointer + 1];
+          const b2 = buf[RxBufPointer + 2];
+          const b3 = buf[RxBufPointer + 3];
+          const b4 = buf[RxBufPointer + 4];
+
+          const energyToSend =
+            (b1 << 24) |
+            (b2 << 16) |
+            (b3 << 8) |
+            (b4);
+
+          console.log(`[OCPP] Received StopTransaction with energy value ${energyToSend} Wh`);
+
+          energy = energyToSend;
+
+          RxBufPointer += 5;
+
+          send(
+          'StopTransaction', { 
+            transactionId: transactionId,
+            idTag: idTag,
+            meterStop: energy,
+            timestamp: new Date().toISOString(),
+            reason: "Remote"
+            }
+          );
+
+        } catch (err) {
+          console.log(`[PROGRAM] ERROR in Energy.Active.Import.Register parser: ${err.message}`);
+          RxBufPointer += 1; // move pointer, so that we are not stuck in infinite loop
+        }
+      }
+      else if (buf[RxBufPointer] === 8 && buf[RxBufPointer + 1]!== undefined){
         const match = pendingCalls.find(entry => entry.OcppMessageTypeVariable === 0b100000000);
         response.configurationKey.push({
         key: 'MeterValueSampleInterval',
@@ -464,36 +430,90 @@ app.post("/lorawan", (req, res) => {
         sendConfigurationWSresponse(responseMessage);
         RxBufPointer += 2;
       }
-      if(buf[RxBufPointer] === 11){
+      else if(buf[RxBufPointer] === 11){
         let dump = buf[RxBufPointer];
         dump = buf[RxBufPointer + 1];
         console.log(`[OCPP] Received CurrentLimit`);
         RxBufPointer +=2;
       }
-      if(buf[RxBufPointer] === 12){
+      else if(buf[RxBufPointer] === 12){
         let dump = buf[RxBufPointer];
         dump = buf[RxBufPointer + 1];
         console.log(`[OCPP] Received PowerLimit`);
         RxBufPointer +=2;
       }
-      if(buf[RxBufPointer] === 13){
-        let dump = buf[RxBufPointer];
-        dump = buf[RxBufPointer + 1];
-        dump = buf[RxBufPointer + 2];
-        dump = buf[RxBufPointer + 3];
-        console.log(`[OCPP] Received Energy.Active.Import.Register`);
-        RxBufPointer +=4;
+      else if (buf[RxBufPointer] === 13) {
+        // First check, if we have 5 bytes: opcode + 4 data bytes
+        if (RxBufPointer + 4 >= buf.length) {
+          console.log(`[OCPP] ERROR: Energy.Active.Import.Register – not enough data. Expecting 5 bytes, only ${buf.length - RxBufPointer} received.`);
+          break; // nebo RxBufPointer++; podle toho, jestli chceš pokračovat, ale nehavarovat
+        }
+
+        try {
+          // safely load 4 bytes
+          const b1 = buf[RxBufPointer + 1];
+          const b2 = buf[RxBufPointer + 2];
+          const b3 = buf[RxBufPointer + 3];
+          const b4 = buf[RxBufPointer + 4];
+
+          const energyToSend =
+            (b1 << 24) |
+            (b2 << 16) |
+            (b3 << 8) |
+            (b4);
+
+          console.log(`[OCPP] Received Energy.Active.Import.Register: ${energyToSend} Wh`);
+
+          energy = energyToSend;
+
+          RxBufPointer += 5;
+
+          send("MeterValues", {
+            connectorId: 1,
+            transactionId: transactionId,
+            meterValue: [
+              {
+                timestamp: new Date().toISOString(),
+                sampledValue: [
+                  {
+                    value: energy,
+                    unit: "Wh",
+                    measurand: "Energy.Active.Import.Register",
+                  },
+                ],
+              },
+            ],
+          });
+
+        } catch (err) {
+          console.log(`[PROGRAM] ERROR in Energy.Active.Import.Register parser: ${err.message}`);
+          RxBufPointer += 1; // move pointer, so that we are not stuck in infinite loop
+        }
       }
-      if(buf[RxBufPointer] === 12){
+
+      /*if(buf[RxBufPointer] === 12){
         let dump = buf[RxBufPointer];
         dump = buf[RxBufPointer + 1];
         console.log(`[OCPP] Received PowerLimit`);
         RxBufPointer +=2;
-      }
-      if(buf[RxBufPointer] === 14){
+      }*/
+      else if(buf[RxBufPointer] === 14){
         let dump = buf[RxBufPointer];
-        dump = buf[RxBufPointer + 1];
-        console.log(`[OCPP] Received PowerLimit`);
+        let connStat = buf[RxBufPointer + 1];
+        console.log(`[OCPP] Received ConnectorStatus`);
+        if(connStat === 1){
+          changeStatus('Available');
+        }
+        else if(connStat === 2){
+          changeStatus('Preparing');
+        }
+        else if(connStat === 3){
+          changeStatus('Charging');
+        }
+        else {
+          changeStatus('Unavailable');
+        }
+        
         RxBufPointer +=2;
       }
     }
